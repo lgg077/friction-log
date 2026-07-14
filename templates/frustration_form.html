@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+
+{% block title %}{{ page_title }}{% endblock %}
+
+{% block content %}
+  <section class="panel form-panel">
+    <div class="form-heading">
+      <p class="eyebrow">Entry Form</p>
+      <h2>{{ page_title }}</h2>
+      <p>Keep the wording practical and specific. The more concrete the description, the easier it is to act on later.</p>
+    </div>
+
+    <form class="entry-form" method="post">
+      <div>
+        <label for="title">Title</label>
+        <input id="title" name="title" type="text" value="{{ form_data['title'] }}" required>
+      </div>
+
+      <div>
+        <label for="department">Department</label>
+        <input id="department" name="department" type="text" value="{{ form_data['department'] }}" required>
+      </div>
+
+      <div class="full-width">
+        <label for="description">Description of what happened</label>
+        <textarea id="description" name="description" rows="4" required>{{ form_data['description'] }}</textarea>
+      </div>
+
+      <div class="full-width">
+        <label for="business_impact">Business impact</label>
+        <textarea id="business_impact" name="business_impact" rows="3" required>{{ form_data['business_impact'] }}</textarea>
+      </div>
+
+      <div>
+        <label for="frequency_value">Frequency</label>
+        <select id="frequency_value" name="frequency_value" required>
+          <option value="">Choose a frequency</option>
+          {% for option in frequency_options %}
+            <option value="{{ option['value'] }}" {% if form_data['frequency_value'] == option['value'] %}selected{% endif %}>
+              {{ option["label"] }}
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div>
+        <label for="pain_score">Pain score (1-10)</label>
+        <input id="pain_score" name="pain_score" type="number" min="1" max="10" value="{{ form_data['pain_score'] }}" required>
+      </div>
+
+      <div>
+        <label for="estimated_hours_lost">Estimated hours lost</label>
+        <input id="estimated_hours_lost" name="estimated_hours_lost" type="number" min="0" step="0.25" value="{{ form_data['estimated_hours_lost'] }}" required>
+      </div>
+
+      <div>
+        <label for="status">Status</label>
+        <select id="status" name="status" required>
+          {% for status in status_options %}
+            <option value="{{ status }}" {% if form_data['status'] == status %}selected{% endif %}>
+              {{ status }}
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="full-width">
+        <label for="current_workaround">Current workaround</label>
+        <textarea id="current_workaround" name="current_workaround" rows="3" required>{{ form_data['current_workaround'] }}</textarea>
+      </div>
+
+      <div class="full-width">
+        <label for="ideal_outcome">Ideal outcome</label>
+        <textarea id="ideal_outcome" name="ideal_outcome" rows="3" required>{{ form_data['ideal_outcome'] }}</textarea>
+      </div>
+
+      <div class="form-actions full-width">
+        <button class="button button-primary" type="submit">{{ submit_label }}</button>
+        <a class="button button-secondary" href="{{ url_for('dashboard') }}">Cancel</a>
+      </div>
+    </form>
+  </section>
+{% endblock %}

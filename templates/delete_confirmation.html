@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+
+{% block title %}Delete Entry{% endblock %}
+
+{% block content %}
+  <section class="panel confirmation-panel">
+    <p class="eyebrow">Delete Entry</p>
+    <h2>Remove "{{ frustration['title'] }}"?</h2>
+    <p>This keeps the app beginner-friendly and safe: deletion requires one extra step so an entry is not removed by accident.</p>
+
+    <form class="confirmation-actions" method="post">
+      <button class="button button-danger" type="submit">Yes, delete it</button>
+      <a class="button button-secondary" href="{{ url_for('dashboard') }}">No, go back</a>
+    </form>
+  </section>
+{% endblock %}
