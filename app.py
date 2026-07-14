@@ -1,16 +1,20 @@
 from __future__ import annotations
 
-import sqlite3
+import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib import error, parse, request as urllib_request
 
-from flask import Flask, current_app, flash, g, redirect, render_template, request, url_for
+from flask import Flask, flash, redirect, render_template, request, url_for
 
 
 BASE_DIR = Path(__file__).resolve().parent
 INSTANCE_DIR = BASE_DIR / "instance"
-DATABASE_PATH = INSTANCE_DIR / "friction_log.db"
+DATA_FILE_PATH = INSTANCE_DIR / "friction_log.json"
+BLOB_API_URL = "https://vercel.com/api/blob"
+BLOB_API_VERSION = "12"
 
 FREQUENCY_OPTIONS = [
     {"value": "rarely", "label": "Rarely", "score": 1},
@@ -33,25 +37,25 @@ FREQUENCY_LOOKUP = {option["value"]: option for option in FREQUENCY_OPTIONS}
 
 def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     app = Flask(__name__, instance_relative_config=True)
+
+    blob_token = os.environ.get("BLOB_READ_WRITE_TOKEN", "").strip()
     app.config.update(
-        SECRET_KEY="friction-log-dev-key",
-        DATABASE=str(DATABASE_PATH),
+        SECRET_KEY=os.environ.get("SECRET_KEY", "friction-log-dev-key"),
+        STORAGE_BACKEND="blob" if blob_token else "file",
+        DATA_FILE=str(DATA_FILE_PATH),
+        BLOB_TOKEN=blob_token,
+        BLOB_ACCESS=os.environ.get("BLOB_ACCESS", "private").strip() or "private",
+        BLOB_PATHNAME=os.environ.get(
+            "BLOB_PATHNAME", "friction-log/frustrations.json"
+        ).strip()
+        or "friction-log/frustrations.json",
     )
 
     if test_config:
         app.config.update(test_config)
 
-    Path(app.config["DATABASE"]).resolve().parent.mkdir(parents=True, exist_ok=True)
-
-    @app.before_request
-    def before_request() -> None:
-        init_db()
-
-    @app.teardown_appcontext
-    def close_db(_: BaseException | None) -> None:
-        db = g.pop("db", None)
-        if db is not None:
-            db.close()
+    if app.config["STORAGE_BACKEND"] == "file":
+        Path(app.config["DATA_FILE"]).resolve().parent.mkdir(parents=True, exist_ok=True)
 
     @app.context_processor
     def inject_shared_data() -> dict[str, Any]:
@@ -65,41 +69,21 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         selected_department = request.args.get("department", "").strip()
         selected_status = request.args.get("status", "").strip()
 
-        query = """
-            SELECT
-                id,
-                title,
-                department,
-                description,
-                business_impact,
-                frequency_value,
-                frequency_label,
-                frequency_score,
-                pain_score,
-                estimated_hours_lost,
-                current_workaround,
-                ideal_outcome,
-                status,
-                date_created,
-                ROUND(pain_score * frequency_score * estimated_hours_lost, 2) AS priority_score
-            FROM frustrations
-            WHERE (? = '' OR department = ?)
-              AND (? = '' OR status = ?)
-            ORDER BY priority_score DESC, date_created DESC
-        """
-
-        frustrations = query_db(
-            query,
-            (
-                selected_department,
-                selected_department,
-                selected_status,
-                selected_status,
-            ),
+        frustrations = load_frustrations()
+        frustrations = [
+            frustration
+            for frustration in frustrations
+            if (not selected_department or frustration["department"] == selected_department)
+            and (not selected_status or frustration["status"] == selected_status)
+        ]
+        frustrations.sort(
+            key=lambda frustration: (
+                -priority_score(frustration),
+                frustration["date_created"],
+            )
         )
-
-        departments = query_db(
-            "SELECT DISTINCT department FROM frustrations ORDER BY department"
+        departments = sorted(
+            {frustration["department"] for frustration in load_frustrations()}
         )
 
         return render_template(
@@ -119,32 +103,20 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             errors = validate_form(form_data)
 
             if not errors:
-                execute_db(
-                    """
-                    INSERT INTO frustrations (
-                        title,
-                        department,
-                        description,
-                        business_impact,
-                        frequency_value,
-                        frequency_label,
-                        frequency_score,
-                        pain_score,
-                        estimated_hours_lost,
-                        current_workaround,
-                        ideal_outcome,
-                        status,
-                        date_created
+                frustrations = load_frustrations()
+                frustrations.append(
+                    build_frustration_record(
+                        form_data=form_data,
+                        frustration_id=next_frustration_id(frustrations),
+                        date_created=datetime.now().strftime("%Y-%m-%d"),
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    frustration_values(form_data, datetime.now().strftime("%Y-%m-%d")),
                 )
+                save_frustrations(frustrations)
                 flash("Frustration added.")
                 return redirect(url_for("dashboard"))
 
-            for error in errors:
-                flash(error, "error")
+            for error_message in errors:
+                flash(error_message, "error")
 
         return render_template(
             "frustration_form.html",
@@ -155,7 +127,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 
     @app.route("/frustrations/<int:frustration_id>/edit", methods=("GET", "POST"))
     def edit_frustration(frustration_id: int) -> str:
-        frustration = get_frustration(frustration_id)
+        frustrations = load_frustrations()
+        frustration = find_frustration(frustrations, frustration_id)
 
         if frustration is None:
             flash("That frustration entry could not be found.", "error")
@@ -168,31 +141,18 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             errors = validate_form(form_data)
 
             if not errors:
-                execute_db(
-                    """
-                    UPDATE frustrations
-                    SET
-                        title = ?,
-                        department = ?,
-                        description = ?,
-                        business_impact = ?,
-                        frequency_value = ?,
-                        frequency_label = ?,
-                        frequency_score = ?,
-                        pain_score = ?,
-                        estimated_hours_lost = ?,
-                        current_workaround = ?,
-                        ideal_outcome = ?,
-                        status = ?
-                    WHERE id = ?
-                    """,
-                    frustration_values(form_data) + (frustration_id,),
+                updated_record = build_frustration_record(
+                    form_data=form_data,
+                    frustration_id=frustration_id,
+                    date_created=frustration["date_created"],
                 )
+                replace_frustration(frustrations, frustration_id, updated_record)
+                save_frustrations(frustrations)
                 flash("Frustration updated.")
                 return redirect(url_for("dashboard"))
 
-            for error in errors:
-                flash(error, "error")
+            for error_message in errors:
+                flash(error_message, "error")
 
         return render_template(
             "frustration_form.html",
@@ -203,14 +163,18 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 
     @app.route("/frustrations/<int:frustration_id>/delete", methods=("GET", "POST"))
     def delete_frustration(frustration_id: int) -> str:
-        frustration = get_frustration(frustration_id)
+        frustrations = load_frustrations()
+        frustration = find_frustration(frustrations, frustration_id)
 
         if frustration is None:
             flash("That frustration entry could not be found.", "error")
             return redirect(url_for("dashboard"))
 
         if request.method == "POST":
-            execute_db("DELETE FROM frustrations WHERE id = ?", (frustration_id,))
+            frustrations = [
+                entry for entry in frustrations if entry["id"] != frustration_id
+            ]
+            save_frustrations(frustrations)
             flash("Frustration deleted.")
             return redirect(url_for("dashboard"))
 
@@ -219,73 +183,197 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     return app
 
 
-def get_db() -> sqlite3.Connection:
-    if "db" not in g:
-        g.db = sqlite3.connect(current_app.config["DATABASE"])
-        g.db.row_factory = sqlite3.Row
-    return g.db
+def load_frustrations() -> list[dict[str, Any]]:
+    if using_blob_storage():
+        return load_frustrations_from_blob()
+    return load_frustrations_from_file()
 
 
-def init_db() -> None:
-    db = get_db()
-    db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS frustrations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            department TEXT NOT NULL,
-            description TEXT NOT NULL,
-            business_impact TEXT NOT NULL,
-            frequency_value TEXT NOT NULL,
-            frequency_label TEXT NOT NULL,
-            frequency_score INTEGER NOT NULL,
-            pain_score INTEGER NOT NULL,
-            estimated_hours_lost REAL NOT NULL,
-            current_workaround TEXT NOT NULL,
-            ideal_outcome TEXT NOT NULL,
-            status TEXT NOT NULL,
-            date_created TEXT NOT NULL
-        )
-        """
+def save_frustrations(frustrations: list[dict[str, Any]]) -> None:
+    normalized = [with_priority_score(frustration) for frustration in frustrations]
+    if using_blob_storage():
+        save_frustrations_to_blob(normalized)
+    else:
+        save_frustrations_to_file(normalized)
+
+
+def using_blob_storage() -> bool:
+    from flask import current_app
+
+    return current_app.config["STORAGE_BACKEND"] == "blob"
+
+
+def load_frustrations_from_file() -> list[dict[str, Any]]:
+    from flask import current_app
+
+    data_file = Path(current_app.config["DATA_FILE"])
+    if not data_file.exists():
+        return []
+    try:
+        content = json.loads(data_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    return [with_priority_score(entry) for entry in content]
+
+
+def save_frustrations_to_file(frustrations: list[dict[str, Any]]) -> None:
+    from flask import current_app
+
+    data_file = Path(current_app.config["DATA_FILE"])
+    data_file.write_text(
+        json.dumps(frustrations, indent=2),
+        encoding="utf-8",
     )
-    db.commit()
 
 
-def query_db(query: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
-    return get_db().execute(query, params).fetchall()
+def load_frustrations_from_blob() -> list[dict[str, Any]]:
+    blob_url = build_blob_url()
+    headers = {"Authorization": f"Bearer {blob_token()}"}
+    request_obj = urllib_request.Request(blob_url, headers=headers, method="GET")
+    try:
+        with urllib_request.urlopen(request_obj, timeout=15) as response:
+            body = response.read().decode("utf-8")
+    except error.HTTPError as exc:
+        if exc.code == 404:
+            return []
+        raise RuntimeError(f"Could not read Blob data: {exc.code}") from exc
+    content = json.loads(body or "[]")
+    return [with_priority_score(entry) for entry in content]
 
 
-def execute_db(query: str, params: tuple[Any, ...]) -> None:
-    db = get_db()
-    db.execute(query, params)
-    db.commit()
+def save_frustrations_to_blob(frustrations: list[dict[str, Any]]) -> None:
+    pathname = blob_pathname()
+    query = parse.urlencode({"pathname": pathname})
+    payload = json.dumps(frustrations).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {blob_token()}",
+        "Content-Type": "application/json",
+        "x-api-version": BLOB_API_VERSION,
+        "x-vercel-blob-store-id": blob_store_id(),
+        "x-vercel-blob-access": blob_access(),
+        "x-content-length": str(len(payload)),
+        "x-content-type": "application/json",
+        "x-add-random-suffix": "0",
+        "x-allow-overwrite": "1",
+    }
+    request_obj = urllib_request.Request(
+        f"{BLOB_API_URL}/?{query}",
+        data=payload,
+        headers=headers,
+        method="PUT",
+    )
+    try:
+        with urllib_request.urlopen(request_obj, timeout=20) as response:
+            response.read()
+    except error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(
+            f"Could not write Blob data: {exc.code} {details}".strip()
+        ) from exc
 
 
-def get_frustration(frustration_id: int) -> sqlite3.Row | None:
-    result = get_db().execute(
-        """
-        SELECT
-            id,
-            title,
-            department,
-            description,
-            business_impact,
-            frequency_value,
-            frequency_label,
-            frequency_score,
-            pain_score,
-            estimated_hours_lost,
-            current_workaround,
-            ideal_outcome,
-            status,
-            date_created,
-            ROUND(pain_score * frequency_score * estimated_hours_lost, 2) AS priority_score
-        FROM frustrations
-        WHERE id = ?
-        """,
-        (frustration_id,),
-    ).fetchone()
-    return result
+def blob_token() -> str:
+    from flask import current_app
+
+    token = current_app.config["BLOB_TOKEN"]
+    if not token:
+        raise RuntimeError("BLOB_READ_WRITE_TOKEN is required for Blob storage.")
+    return token
+
+
+def blob_access() -> str:
+    from flask import current_app
+
+    access = current_app.config["BLOB_ACCESS"]
+    if access not in {"public", "private"}:
+        raise RuntimeError("BLOB_ACCESS must be either 'public' or 'private'.")
+    return access
+
+
+def blob_pathname() -> str:
+    from flask import current_app
+
+    return current_app.config["BLOB_PATHNAME"]
+
+
+def blob_store_id() -> str:
+    token = blob_token()
+    parts = token.split("_")
+    if len(parts) < 4 or not parts[3]:
+        raise RuntimeError("Could not extract the Blob store ID from the read/write token.")
+    return parts[3]
+
+
+def build_blob_url() -> str:
+    return (
+        f"https://{blob_store_id()}.{blob_access()}.blob.vercel-storage.com/"
+        f"{blob_pathname()}"
+    )
+
+
+def priority_score(frustration: dict[str, Any]) -> float:
+    return round(
+        float(frustration["pain_score"])
+        * float(frustration["frequency_score"])
+        * float(frustration["estimated_hours_lost"]),
+        2,
+    )
+
+
+def with_priority_score(frustration: dict[str, Any]) -> dict[str, Any]:
+    frustration_copy = dict(frustration)
+    frustration_copy["priority_score"] = priority_score(frustration_copy)
+    return frustration_copy
+
+
+def next_frustration_id(frustrations: list[dict[str, Any]]) -> int:
+    if not frustrations:
+        return 1
+    return max(int(frustration["id"]) for frustration in frustrations) + 1
+
+
+def build_frustration_record(
+    form_data: dict[str, str], frustration_id: int, date_created: str
+) -> dict[str, Any]:
+    frequency = FREQUENCY_LOOKUP[form_data["frequency_value"]]
+    return with_priority_score(
+        {
+            "id": frustration_id,
+            "title": form_data["title"],
+            "department": form_data["department"],
+            "description": form_data["description"],
+            "business_impact": form_data["business_impact"],
+            "frequency_value": form_data["frequency_value"],
+            "frequency_label": frequency["label"],
+            "frequency_score": frequency["score"],
+            "pain_score": int(form_data["pain_score"]),
+            "estimated_hours_lost": float(form_data["estimated_hours_lost"]),
+            "current_workaround": form_data["current_workaround"],
+            "ideal_outcome": form_data["ideal_outcome"],
+            "status": form_data["status"],
+            "date_created": date_created,
+        }
+    )
+
+
+def find_frustration(
+    frustrations: list[dict[str, Any]], frustration_id: int
+) -> dict[str, Any] | None:
+    for frustration in frustrations:
+        if frustration["id"] == frustration_id:
+            return with_priority_score(frustration)
+    return None
+
+
+def replace_frustration(
+    frustrations: list[dict[str, Any]],
+    frustration_id: int,
+    updated_record: dict[str, Any],
+) -> None:
+    for index, frustration in enumerate(frustrations):
+        if frustration["id"] == frustration_id:
+            frustrations[index] = updated_record
+            return
 
 
 def default_form_data() -> dict[str, str]:
@@ -303,7 +391,7 @@ def default_form_data() -> dict[str, str]:
     }
 
 
-def row_to_form_data(frustration: sqlite3.Row) -> dict[str, str]:
+def row_to_form_data(frustration: dict[str, Any]) -> dict[str, str]:
     return {
         "title": frustration["title"],
         "department": frustration["department"],
@@ -358,34 +446,11 @@ def validate_form(form_data: dict[str, str]) -> list[str]:
 def unique_errors(errors: list[str]) -> list[str]:
     seen: set[str] = set()
     unique: list[str] = []
-    for error in errors:
-        if error not in seen:
-            unique.append(error)
-            seen.add(error)
+    for error_message in errors:
+        if error_message not in seen:
+            unique.append(error_message)
+            seen.add(error_message)
     return unique
-
-
-def frustration_values(
-    form_data: dict[str, str], date_created: str | None = None
-) -> tuple[Any, ...]:
-    frequency = FREQUENCY_LOOKUP[form_data["frequency_value"]]
-    values: list[Any] = [
-        form_data["title"],
-        form_data["department"],
-        form_data["description"],
-        form_data["business_impact"],
-        form_data["frequency_value"],
-        frequency["label"],
-        frequency["score"],
-        int(form_data["pain_score"]),
-        float(form_data["estimated_hours_lost"]),
-        form_data["current_workaround"],
-        form_data["ideal_outcome"],
-        form_data["status"],
-    ]
-    if date_created is not None:
-        values.append(date_created)
-    return tuple(values)
 
 
 app = create_app()

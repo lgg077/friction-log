@@ -8,12 +8,13 @@ from app import create_app
 class FrictionLogTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
-        database_path = os.path.join(self.temp_dir.name, "test.db")
+        data_file_path = os.path.join(self.temp_dir.name, "test.json")
         self.app = create_app(
             {
                 "TESTING": True,
                 "SECRET_KEY": "test",
-                "DATABASE": database_path,
+                "STORAGE_BACKEND": "file",
+                "DATA_FILE": data_file_path,
             }
         )
         self.client = self.app.test_client()
