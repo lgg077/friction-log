@@ -40,9 +40,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     app.config.update(
         SECRET_KEY=os.environ.get("SECRET_KEY", "friction-log-dev-key"),
         DATA_FILE=str(DATA_FILE_PATH),
-        STORAGE_BACKEND=(
-            "supabase" if os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip() else "file"
-        ),
+        STORAGE_BACKEND="file",
         SUPABASE_URL=os.environ.get("SUPABASE_URL", DEFAULT_SUPABASE_URL).strip()
         or DEFAULT_SUPABASE_URL,
         SUPABASE_SERVICE_ROLE_KEY=os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip(),
@@ -51,8 +49,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     if test_config:
         app.config.update(test_config)
 
-    if os.environ.get("VERCEL") and app.config["SECRET_KEY"] == "friction-log-dev-key":
-        raise RuntimeError("SECRET_KEY must be set in Vercel.")
+    app.config["STORAGE_BACKEND"] = (
+        "supabase" if app.config["SUPABASE_SERVICE_ROLE_KEY"].strip() else "file"
+    )
 
     if os.environ.get("VERCEL") and app.config["STORAGE_BACKEND"] != "supabase":
         raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY must be set in Vercel.")

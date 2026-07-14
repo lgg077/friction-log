@@ -118,7 +118,6 @@ The default project URL in the app points at:
 Set these in your Vercel project:
 
 - `SUPABASE_SERVICE_ROLE_KEY` = your Supabase service role key
-- `SECRET_KEY` = any long random secret string
 
 Optional if you ever switch to a different Supabase project later:
 
