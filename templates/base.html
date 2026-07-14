@@ -17,7 +17,9 @@
           <h1><a href="{{ url_for('dashboard') }}">Friction Log</a></h1>
           <p class="hero-copy">Capture recurring frustrations, surface their true cost, and focus improvement work where it matters most.</p>
         </div>
-        <a class="button button-primary" href="{{ url_for('create_frustration') }}">Add frustration</a>
+        <div class="hero-actions">
+          <a class="button button-primary" href="{{ url_for('create_frustration') }}">Add frustration</a>
+        </div>
       </header>
 
       {% with messages = get_flashed_messages(with_categories=true) %}

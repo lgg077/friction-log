@@ -13,8 +13,12 @@ class FrictionLogTests(unittest.TestCase):
             {
                 "TESTING": True,
                 "SECRET_KEY": "test",
-                "STORAGE_BACKEND": "file",
                 "DATA_FILE": data_file_path,
+                "STORAGE_BACKEND": "file",
+                "ADMIN_USERNAME": "",
+                "ADMIN_PASSWORD": "",
+                "ADMIN_PASSWORD_HASH": "",
+                "REQUIRE_LOGIN": False,
             }
         )
         self.client = self.app.test_client()

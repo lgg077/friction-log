@@ -10,8 +10,8 @@
         <select id="department" name="department">
           <option value="">All departments</option>
           {% for department in departments %}
-            <option value="{{ department['department'] }}" {% if selected_department == department['department'] %}selected{% endif %}>
-              {{ department["department"] }}
+            <option value="{{ department }}" {% if selected_department == department %}selected{% endif %}>
+              {{ department }}
             </option>
           {% endfor %}
         </select>

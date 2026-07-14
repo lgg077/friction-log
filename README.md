@@ -9,7 +9,7 @@ Friction Log is a beginner-friendly Flask web app for tracking repeated workplac
 - Edit and delete actions
 - Filters for department and status
 - Automatic priority scoring
-- Persistent storage with a local JSON file or Vercel Blob
+- Persistent storage with a local JSON file in development and Supabase Postgres in production
 
 ## How Priority Works
 
@@ -95,26 +95,34 @@ The data file will be created automatically in the `instance` folder the first t
 
 ## Deploying to Vercel
 
-This project is now set up for a non-SQL deployment path on Vercel.
+This project is now set up for a production launch on Vercel with Supabase.
 
 ### What changed
 
 - `main.py` is included as the Flask entrypoint Vercel expects.
 - `vercel.json` sets the Python function configuration.
-- The app uses a local JSON file when running on your machine.
-- The app uses Vercel Blob when `BLOB_READ_WRITE_TOKEN` is set.
+- Local development still uses a simple JSON file.
+- Production uses your Supabase project named `Friction`.
+- The app stays simple with no login screen.
+
+### Supabase setup
+
+The app expects a `public.frustrations` table in Supabase. That table has already been prepared in your `Friction` project.
+
+The default project URL in the app points at:
+
+`https://kdqmcufctsvjiyeuajpe.supabase.co`
 
 ### Vercel environment variables
 
 Set these in your Vercel project:
 
-- `BLOB_READ_WRITE_TOKEN` = your Vercel Blob read/write token
+- `SUPABASE_SERVICE_ROLE_KEY` = your Supabase service role key
 - `SECRET_KEY` = any long random secret string
 
-Optional:
+Optional if you ever switch to a different Supabase project later:
 
-- `BLOB_ACCESS` = `private` or `public` (default is `private`)
-- `BLOB_PATHNAME` = the JSON file path inside Blob storage
+- `SUPABASE_URL` = override the default Supabase project URL
 
 Once those are set, redeploy the project.
 
@@ -128,7 +136,7 @@ uv run --with Flask==3.0.3 python -m unittest discover -s tests
 
 - The app uses Flask because it keeps the project small and easy to follow.
 - Local development stores the data in one JSON file, so there is no separate database server to set up.
-- Deployment can use Vercel Blob so the app does not need SQL at all.
+- Production storage is handled by Supabase, which is a much better fit for a hosted multi-request app than local files.
 - The templates folder holds the page layouts.
 - The static folder holds the CSS for the visual design.
 - `app.py` contains the routes, database setup, validation, and helper functions in one place so it is easier to learn from in version 1.

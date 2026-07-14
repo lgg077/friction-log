@@ -56,6 +56,13 @@ a {
   margin-bottom: 1.5rem;
 }
 
+.hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+}
+
 .eyebrow {
   margin: 0 0 0.4rem;
   text-transform: uppercase;
@@ -275,6 +282,15 @@ textarea:focus {
 
 .form-heading {
   margin-bottom: 1rem;
+}
+
+.auth-panel {
+  max-width: 640px;
+  margin: 0 auto;
+}
+
+.auth-form {
+  grid-template-columns: 1fr;
 }
 
 .empty-state {

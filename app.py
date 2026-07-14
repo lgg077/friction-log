@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib import error, parse, request as urllib_request
@@ -13,8 +13,7 @@ from flask import Flask, flash, redirect, render_template, request, url_for
 BASE_DIR = Path(__file__).resolve().parent
 INSTANCE_DIR = BASE_DIR / "instance"
 DATA_FILE_PATH = INSTANCE_DIR / "friction_log.json"
-BLOB_API_URL = "https://vercel.com/api/blob"
-BLOB_API_VERSION = "12"
+DEFAULT_SUPABASE_URL = "https://kdqmcufctsvjiyeuajpe.supabase.co"
 
 FREQUENCY_OPTIONS = [
     {"value": "rarely", "label": "Rarely", "score": 1},
@@ -38,21 +37,25 @@ FREQUENCY_LOOKUP = {option["value"]: option for option in FREQUENCY_OPTIONS}
 def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     app = Flask(__name__, instance_relative_config=True)
 
-    blob_token = os.environ.get("BLOB_READ_WRITE_TOKEN", "").strip()
     app.config.update(
         SECRET_KEY=os.environ.get("SECRET_KEY", "friction-log-dev-key"),
-        STORAGE_BACKEND="blob" if blob_token else "file",
         DATA_FILE=str(DATA_FILE_PATH),
-        BLOB_TOKEN=blob_token,
-        BLOB_ACCESS=os.environ.get("BLOB_ACCESS", "private").strip() or "private",
-        BLOB_PATHNAME=os.environ.get(
-            "BLOB_PATHNAME", "friction-log/frustrations.json"
-        ).strip()
-        or "friction-log/frustrations.json",
+        STORAGE_BACKEND=(
+            "supabase" if os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip() else "file"
+        ),
+        SUPABASE_URL=os.environ.get("SUPABASE_URL", DEFAULT_SUPABASE_URL).strip()
+        or DEFAULT_SUPABASE_URL,
+        SUPABASE_SERVICE_ROLE_KEY=os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip(),
     )
 
     if test_config:
         app.config.update(test_config)
+
+    if os.environ.get("VERCEL") and app.config["SECRET_KEY"] == "friction-log-dev-key":
+        raise RuntimeError("SECRET_KEY must be set in Vercel.")
+
+    if os.environ.get("VERCEL") and app.config["STORAGE_BACKEND"] != "supabase":
+        raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY must be set in Vercel.")
 
     if app.config["STORAGE_BACKEND"] == "file":
         Path(app.config["DATA_FILE"]).resolve().parent.mkdir(parents=True, exist_ok=True)
@@ -103,15 +106,17 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             errors = validate_form(form_data)
 
             if not errors:
-                frustrations = load_frustrations()
-                frustrations.append(
-                    build_frustration_record(
-                        form_data=form_data,
-                        frustration_id=next_frustration_id(frustrations),
-                        date_created=datetime.now().strftime("%Y-%m-%d"),
+                if using_supabase_storage():
+                    create_frustration_in_supabase(form_data)
+                else:
+                    frustrations = load_frustrations()
+                    frustrations.append(
+                        build_local_record(
+                            form_data=form_data,
+                            frustration_id=next_frustration_id(frustrations),
+                        )
                     )
-                )
-                save_frustrations(frustrations)
+                    save_frustrations_to_file(frustrations)
                 flash("Frustration added.")
                 return redirect(url_for("dashboard"))
 
@@ -127,8 +132,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 
     @app.route("/frustrations/<int:frustration_id>/edit", methods=("GET", "POST"))
     def edit_frustration(frustration_id: int) -> str:
-        frustrations = load_frustrations()
-        frustration = find_frustration(frustrations, frustration_id)
+        frustration = get_frustration(frustration_id)
 
         if frustration is None:
             flash("That frustration entry could not be found.", "error")
@@ -141,13 +145,17 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             errors = validate_form(form_data)
 
             if not errors:
-                updated_record = build_frustration_record(
-                    form_data=form_data,
-                    frustration_id=frustration_id,
-                    date_created=frustration["date_created"],
-                )
-                replace_frustration(frustrations, frustration_id, updated_record)
-                save_frustrations(frustrations)
+                if using_supabase_storage():
+                    update_frustration_in_supabase(frustration_id, form_data)
+                else:
+                    frustrations = load_frustrations()
+                    updated_record = build_local_record(
+                        form_data=form_data,
+                        frustration_id=frustration_id,
+                        created_at=frustration["created_at"],
+                    )
+                    replace_frustration(frustrations, frustration_id, updated_record)
+                    save_frustrations_to_file(frustrations)
                 flash("Frustration updated.")
                 return redirect(url_for("dashboard"))
 
@@ -163,18 +171,20 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 
     @app.route("/frustrations/<int:frustration_id>/delete", methods=("GET", "POST"))
     def delete_frustration(frustration_id: int) -> str:
-        frustrations = load_frustrations()
-        frustration = find_frustration(frustrations, frustration_id)
+        frustration = get_frustration(frustration_id)
 
         if frustration is None:
             flash("That frustration entry could not be found.", "error")
             return redirect(url_for("dashboard"))
 
         if request.method == "POST":
-            frustrations = [
-                entry for entry in frustrations if entry["id"] != frustration_id
-            ]
-            save_frustrations(frustrations)
+            if using_supabase_storage():
+                delete_frustration_from_supabase(frustration_id)
+            else:
+                frustrations = [
+                    entry for entry in load_frustrations() if entry["id"] != frustration_id
+                ]
+                save_frustrations_to_file(frustrations)
             flash("Frustration deleted.")
             return redirect(url_for("dashboard"))
 
@@ -183,24 +193,24 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     return app
 
 
+def using_supabase_storage() -> bool:
+    from flask import current_app
+
+    return current_app.config["STORAGE_BACKEND"] == "supabase"
+
+
 def load_frustrations() -> list[dict[str, Any]]:
-    if using_blob_storage():
-        return load_frustrations_from_blob()
+    if using_supabase_storage():
+        return load_frustrations_from_supabase()
     return load_frustrations_from_file()
 
 
-def save_frustrations(frustrations: list[dict[str, Any]]) -> None:
-    normalized = [with_priority_score(frustration) for frustration in frustrations]
-    if using_blob_storage():
-        save_frustrations_to_blob(normalized)
-    else:
-        save_frustrations_to_file(normalized)
-
-
-def using_blob_storage() -> bool:
-    from flask import current_app
-
-    return current_app.config["STORAGE_BACKEND"] == "blob"
+def get_frustration(frustration_id: int) -> dict[str, Any] | None:
+    frustrations = load_frustrations()
+    for frustration in frustrations:
+        if int(frustration["id"]) == frustration_id:
+            return frustration
+    return None
 
 
 def load_frustrations_from_file() -> list[dict[str, Any]]:
@@ -213,102 +223,155 @@ def load_frustrations_from_file() -> list[dict[str, Any]]:
         content = json.loads(data_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return []
-    return [with_priority_score(entry) for entry in content]
+    return [normalize_frustration_record(entry) for entry in content]
 
 
 def save_frustrations_to_file(frustrations: list[dict[str, Any]]) -> None:
     from flask import current_app
 
     data_file = Path(current_app.config["DATA_FILE"])
-    data_file.write_text(
-        json.dumps(frustrations, indent=2),
-        encoding="utf-8",
+    stored = [strip_computed_fields(frustration) for frustration in frustrations]
+    data_file.write_text(json.dumps(stored, indent=2), encoding="utf-8")
+
+
+def load_frustrations_from_supabase() -> list[dict[str, Any]]:
+    rows = supabase_request_json(
+        method="GET",
+        path="/rest/v1/frustrations",
+        query_params={
+            "select": "*",
+            "order": "created_at.desc",
+        },
+    )
+    return [normalize_frustration_record(row) for row in rows]
+
+
+def create_frustration_in_supabase(form_data: dict[str, str]) -> None:
+    supabase_request_json(
+        method="POST",
+        path="/rest/v1/frustrations",
+        json_body=build_supabase_payload(form_data),
+        extra_headers={"Prefer": "return=minimal"},
     )
 
 
-def load_frustrations_from_blob() -> list[dict[str, Any]]:
-    blob_url = build_blob_url()
-    headers = {"Authorization": f"Bearer {blob_token()}"}
-    request_obj = urllib_request.Request(blob_url, headers=headers, method="GET")
-    try:
-        with urllib_request.urlopen(request_obj, timeout=15) as response:
-            body = response.read().decode("utf-8")
-    except error.HTTPError as exc:
-        if exc.code == 404:
-            return []
-        raise RuntimeError(f"Could not read Blob data: {exc.code}") from exc
-    content = json.loads(body or "[]")
-    return [with_priority_score(entry) for entry in content]
+def update_frustration_in_supabase(frustration_id: int, form_data: dict[str, str]) -> None:
+    payload = build_supabase_payload(form_data)
+    payload["updated_at"] = utc_now_iso()
+    supabase_request_json(
+        method="PATCH",
+        path="/rest/v1/frustrations",
+        query_params={"id": f"eq.{frustration_id}"},
+        json_body=payload,
+        extra_headers={"Prefer": "return=minimal"},
+    )
 
 
-def save_frustrations_to_blob(frustrations: list[dict[str, Any]]) -> None:
-    pathname = blob_pathname()
-    query = parse.urlencode({"pathname": pathname})
-    payload = json.dumps(frustrations).encode("utf-8")
-    headers = {
-        "Authorization": f"Bearer {blob_token()}",
-        "Content-Type": "application/json",
-        "x-api-version": BLOB_API_VERSION,
-        "x-vercel-blob-store-id": blob_store_id(),
-        "x-vercel-blob-access": blob_access(),
-        "x-content-length": str(len(payload)),
-        "x-content-type": "application/json",
-        "x-add-random-suffix": "0",
-        "x-allow-overwrite": "1",
+def delete_frustration_from_supabase(frustration_id: int) -> None:
+    supabase_request_json(
+        method="DELETE",
+        path="/rest/v1/frustrations",
+        query_params={"id": f"eq.{frustration_id}"},
+        extra_headers={"Prefer": "return=minimal"},
+    )
+
+
+def build_supabase_payload(form_data: dict[str, str]) -> dict[str, Any]:
+    frequency = FREQUENCY_LOOKUP[form_data["frequency_value"]]
+    return {
+        "title": form_data["title"],
+        "department": form_data["department"],
+        "description": form_data["description"],
+        "business_impact": form_data["business_impact"],
+        "frequency_value": form_data["frequency_value"],
+        "frequency_label": frequency["label"],
+        "frequency_score": frequency["score"],
+        "pain_score": int(form_data["pain_score"]),
+        "estimated_hours_lost": float(form_data["estimated_hours_lost"]),
+        "current_workaround": form_data["current_workaround"],
+        "ideal_outcome": form_data["ideal_outcome"],
+        "status": form_data["status"],
     }
-    request_obj = urllib_request.Request(
-        f"{BLOB_API_URL}/?{query}",
-        data=payload,
-        headers=headers,
-        method="PUT",
-    )
+
+
+def supabase_request_json(
+    method: str,
+    path: str,
+    query_params: dict[str, str] | None = None,
+    json_body: Any | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> Any:
+    from flask import current_app
+
+    base_url = current_app.config["SUPABASE_URL"].rstrip("/")
+    service_role_key = current_app.config["SUPABASE_SERVICE_ROLE_KEY"]
+    if not service_role_key:
+        raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY is required for Supabase storage.")
+
+    url = f"{base_url}{path}"
+    if query_params:
+        url = f"{url}?{parse.urlencode(query_params)}"
+
+    headers = {
+        "apikey": service_role_key,
+        "Authorization": f"Bearer {service_role_key}",
+        "Content-Type": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+
+    payload = None
+    if json_body is not None:
+        payload = json.dumps(json_body).encode("utf-8")
+
+    request_obj = urllib_request.Request(url, data=payload, headers=headers, method=method)
     try:
         with urllib_request.urlopen(request_obj, timeout=20) as response:
-            response.read()
+            body = response.read().decode("utf-8")
     except error.HTTPError as exc:
         details = exc.read().decode("utf-8", errors="ignore")
         raise RuntimeError(
-            f"Could not write Blob data: {exc.code} {details}".strip()
+            f"Supabase request failed: {exc.code} {details}".strip()
         ) from exc
 
-
-def blob_token() -> str:
-    from flask import current_app
-
-    token = current_app.config["BLOB_TOKEN"]
-    if not token:
-        raise RuntimeError("BLOB_READ_WRITE_TOKEN is required for Blob storage.")
-    return token
+    if not body:
+        return []
+    return json.loads(body)
 
 
-def blob_access() -> str:
-    from flask import current_app
-
-    access = current_app.config["BLOB_ACCESS"]
-    if access not in {"public", "private"}:
-        raise RuntimeError("BLOB_ACCESS must be either 'public' or 'private'.")
-    return access
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def blob_pathname() -> str:
-    from flask import current_app
+def normalize_frustration_record(frustration: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(frustration)
+    if "created_at" not in normalized:
+        normalized["created_at"] = utc_now_iso()
+    if "updated_at" not in normalized:
+        normalized["updated_at"] = normalized["created_at"]
+    normalized["estimated_hours_lost"] = float(normalized["estimated_hours_lost"])
+    normalized["pain_score"] = int(normalized["pain_score"])
+    normalized["frequency_score"] = int(normalized["frequency_score"])
+    normalized["date_created"] = normalized["created_at"][:10]
+    normalized["priority_score"] = priority_score(normalized)
+    return normalized
 
-    return current_app.config["BLOB_PATHNAME"]
+
+def strip_computed_fields(frustration: dict[str, Any]) -> dict[str, Any]:
+    stored = dict(frustration)
+    stored.pop("priority_score", None)
+    stored.pop("date_created", None)
+    return stored
 
 
-def blob_store_id() -> str:
-    token = blob_token()
-    parts = token.split("_")
-    if len(parts) < 4 or not parts[3]:
-        raise RuntimeError("Could not extract the Blob store ID from the read/write token.")
-    return parts[3]
-
-
-def build_blob_url() -> str:
-    return (
-        f"https://{blob_store_id()}.{blob_access()}.blob.vercel-storage.com/"
-        f"{blob_pathname()}"
-    )
+def build_local_record(
+    form_data: dict[str, str], frustration_id: int, created_at: str | None = None
+) -> dict[str, Any]:
+    payload = build_supabase_payload(form_data)
+    payload["id"] = frustration_id
+    payload["created_at"] = created_at or utc_now_iso()
+    payload["updated_at"] = utc_now_iso()
+    return normalize_frustration_record(payload)
 
 
 def priority_score(frustration: dict[str, Any]) -> float:
@@ -320,49 +383,10 @@ def priority_score(frustration: dict[str, Any]) -> float:
     )
 
 
-def with_priority_score(frustration: dict[str, Any]) -> dict[str, Any]:
-    frustration_copy = dict(frustration)
-    frustration_copy["priority_score"] = priority_score(frustration_copy)
-    return frustration_copy
-
-
 def next_frustration_id(frustrations: list[dict[str, Any]]) -> int:
     if not frustrations:
         return 1
     return max(int(frustration["id"]) for frustration in frustrations) + 1
-
-
-def build_frustration_record(
-    form_data: dict[str, str], frustration_id: int, date_created: str
-) -> dict[str, Any]:
-    frequency = FREQUENCY_LOOKUP[form_data["frequency_value"]]
-    return with_priority_score(
-        {
-            "id": frustration_id,
-            "title": form_data["title"],
-            "department": form_data["department"],
-            "description": form_data["description"],
-            "business_impact": form_data["business_impact"],
-            "frequency_value": form_data["frequency_value"],
-            "frequency_label": frequency["label"],
-            "frequency_score": frequency["score"],
-            "pain_score": int(form_data["pain_score"]),
-            "estimated_hours_lost": float(form_data["estimated_hours_lost"]),
-            "current_workaround": form_data["current_workaround"],
-            "ideal_outcome": form_data["ideal_outcome"],
-            "status": form_data["status"],
-            "date_created": date_created,
-        }
-    )
-
-
-def find_frustration(
-    frustrations: list[dict[str, Any]], frustration_id: int
-) -> dict[str, Any] | None:
-    for frustration in frustrations:
-        if frustration["id"] == frustration_id:
-            return with_priority_score(frustration)
-    return None
 
 
 def replace_frustration(
@@ -371,7 +395,7 @@ def replace_frustration(
     updated_record: dict[str, Any],
 ) -> None:
     for index, frustration in enumerate(frustrations):
-        if frustration["id"] == frustration_id:
+        if int(frustration["id"]) == frustration_id:
             frustrations[index] = updated_record
             return
 
